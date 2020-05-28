@@ -1,6 +1,92 @@
+use serde::{Deserialize, Serialize};
 use serialport::prelude::*;
+use std::collections::HashMap;
 use std::process::exit;
 use std::time::Duration;
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum MappingType {
+    ASCII,
+    Bitfield,
+    Boolean,
+    Decimal,
+    Enum,
+    Float,
+    Integer,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum MappingEndianness {
+    Big,
+    Little,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MappingScale {
+    pub factor: String,
+    pub offset: u16,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MappingProperties {
+    pub endianness: Option<MappingEndianness>,
+    pub scale: Option<MappingScale>,
+    pub elements: Option<HashMap<String, String>>,
+    pub signed: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct BitfieldProperties {
+    pub endianness: Option<MappingEndianness>,
+    pub fields: HashMap<String, u16>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Mapping {
+    Bitfield {
+        address: u16,
+        count: u16,
+        key: String,
+        table: String,
+        properties: BitfieldProperties,
+        unit: Option<String>,
+    },
+    Boolean {
+        address: u16,
+        count: u16,
+        key: String,
+        table: String,
+        properties: Option<MappingProperties>,
+        unit: Option<String>,
+    },
+    Decimal {
+        address: u16,
+        count: u16,
+        key: String,
+        table: String,
+        properties: Option<MappingProperties>,
+        unit: Option<String>,
+    },
+    Float {
+        address: u16,
+        count: u16,
+        key: String,
+        table: String,
+        properties: Option<MappingProperties>,
+        unit: Option<String>,
+    },
+    Integer {
+        address: u16,
+        count: u16,
+        key: String,
+        table: String,
+        properties: Option<MappingProperties>,
+        unit: Option<String>,
+    },
+}
 
 mod modbus {
     pub const FUNCTION_CODE_LEN: usize = 1;
@@ -28,8 +114,8 @@ mod modbus {
             fn to_bytes(&self) -> Vec<u8> {
                 let mut pdu = Vec::with_capacity(5);
                 pdu.push(FC_READ_HOLDING_REGISTERS);
-                pdu.append(&mut self.starting_address.to_be_bytes().to_vec());
-                pdu.append(&mut self.register_count.to_be_bytes().to_vec());
+                pdu.extend(&self.starting_address.to_be_bytes());
+                pdu.extend(&self.register_count.to_be_bytes());
 
                 pdu
             }
@@ -92,15 +178,15 @@ mod modbus {
                 adu.push(self.unit_id);
                 adu.append(&mut pdu);
 
-                let mut crc = self::crc::crc(&adu).to_be_bytes().to_vec();
-                adu.append(&mut crc);
+                let crc = self::crc::crc(&adu).to_be_bytes();
+                adu.extend(&crc);
 
                 adu
             }
         }
 
         impl Response {
-            pub fn from_vec(buf: &[u8]) -> Result<Self, String> {
+            pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
                 let unit_id = buf[0];
                 let function_code = buf[1];
                 let buf_len = buf.len();
@@ -150,7 +236,11 @@ fn main() {
         .expect("<baud_rate> is required")
         .parse::<u32>()
         .unwrap();
-    let unit_id = std::env::args().nth(3).expect("<unit_id> is required");
+    let unit_id = std::env::args()
+        .nth(3)
+        .expect("<unit_id> is required")
+        .parse::<u8>()
+        .unwrap();
     let mapping_path = std::env::args().nth(4).expect("<mapping_path> is required");
     let sampling_interval = std::env::args()
         .nth(5)
@@ -165,33 +255,19 @@ fn main() {
         timeout: Duration::from_millis(1000),
     };
 
+    let content = std::fs::read_to_string(mapping_path).unwrap();
+    let mappings = serde_json::from_str::<Vec<Mapping>>(&content).unwrap();
+
+    println!("{:?}", mappings);
+
     match serialport::open_with_settings(&device_path, &port_settings) {
         Ok(mut serial_port) => {
-            let request = Box::new(modbus::request::ReadHoldingRegisters {
-                starting_address: 0,
-                register_count: 10,
-            });
+            let values: Vec<(String, u16)> = mappings
+                .iter()
+                .map(|mapping| read_mapping(&mut serial_port, unit_id, mapping))
+                .collect();
 
-            let rtu_request = modbus::rtu::Request {
-                request,
-                unit_id: 1,
-            };
-
-            let request_bytes = rtu_request.to_bytes();
-            let bytes_count = serial_port.write(&request_bytes).unwrap();
-            println!(
-                "Wrote {} bytes: {:X?}",
-                bytes_count.to_string(),
-                request_bytes
-            );
-
-            let resp = read_response(&mut serial_port, &rtu_request).unwrap();
-
-            println!("Received {:?}", resp);
-
-            let resp = modbus::rtu::Response::from_vec(&resp);
-
-            println!("Decoded as {:?}", resp);
+            println!("{:?}", values);
         }
         Err(error) => {
             eprintln!("{}: {}", device_path, error);
@@ -200,7 +276,38 @@ fn main() {
     }
 }
 
-fn read_response<T: std::io::Read>(
+fn read_mapping<T: std::io::Read + std::io::Write>(
+    stream: &mut T,
+    unit_id: u8,
+    mapping: &Mapping,
+) -> (String, u16) {
+    let request = Box::new(modbus::request::ReadHoldingRegisters {
+        starting_address: mapping_address(mapping),
+        register_count: mapping_register_count(mapping),
+    });
+
+    let rtu_request = modbus::rtu::Request { request, unit_id };
+
+    let request_bytes = rtu_request.to_bytes();
+    let bytes_count = stream.write(&request_bytes).unwrap();
+    println!(
+        "Wrote {} bytes: {:X?}",
+        bytes_count.to_string(),
+        request_bytes
+    );
+
+    let resp = read_rtu_response(stream, &rtu_request).unwrap();
+
+    println!("Received {:?}", resp);
+
+    let resp = modbus::rtu::Response::from_bytes(&resp).unwrap();
+
+    println!("Decoded as {:?}", resp);
+
+    (mapping_key(mapping).to_string(), 0)
+}
+
+fn read_rtu_response<T: std::io::Read>(
     reader: &mut T,
     request: &modbus::rtu::Request,
 ) -> Result<Vec<u8>, String> {
@@ -230,5 +337,35 @@ fn read_response_part<T: std::io::Read>(
     match reader.read_exact(&mut raw_response) {
         Ok(()) => Ok(raw_response),
         Err(err) => Err(err),
+    }
+}
+
+fn mapping_address(mapping: &Mapping) -> u16 {
+    match mapping {
+        Mapping::Bitfield { address, .. } => *address,
+        Mapping::Boolean { address, .. } => *address,
+        Mapping::Decimal { address, .. } => *address,
+        Mapping::Float { address, .. } => *address,
+        Mapping::Integer { address, .. } => *address,
+    }
+}
+
+fn mapping_register_count(mapping: &Mapping) -> u16 {
+    match mapping {
+        Mapping::Bitfield { count, .. } => *count,
+        Mapping::Boolean { count, .. } => *count,
+        Mapping::Decimal { count, .. } => *count,
+        Mapping::Float { count, .. } => *count,
+        Mapping::Integer { count, .. } => *count,
+    }
+}
+
+fn mapping_key(mapping: &Mapping) -> &str {
+    match mapping {
+        Mapping::Bitfield { key, .. } => key,
+        Mapping::Boolean { key, .. } => key,
+        Mapping::Decimal { key, .. } => key,
+        Mapping::Float { key, .. } => key,
+        Mapping::Integer { key, .. } => key,
     }
 }
