@@ -1,4 +1,5 @@
 pub const FUNCTION_CODE_LEN: usize = 1;
+pub const FC_READ_HOLDING_REGISTERS: u8 = 0x03;
 
 pub enum Protocol {
     RTU,
@@ -10,71 +11,79 @@ pub enum Mode {
     Slave,
 }
 
-pub trait Request {
-    fn expected_response_len(&self) -> usize;
-    fn to_bytes(&self) -> Vec<u8>;
-    fn len(&self) -> usize;
+#[derive(Debug)]
+pub enum Request {
+    ReadHoldingRegisters {
+        starting_address: u16,
+        register_count: u16,
+    },
 }
 
-pub trait Response: std::fmt::Debug {}
+#[derive(Debug)]
+pub enum Response {
+    ReadHoldingRegistersResponse { byte_count: u8, values: Vec<u16> },
+}
 
-pub mod request {
-    pub const FC_READ_HOLDING_REGISTERS: u8 = 0x03;
+impl Request {
+    fn expected_response_len(&self) -> usize {
+        let body_size = match self {
+            Request::ReadHoldingRegisters { register_count, .. } => register_count * 2,
+        };
 
-    pub struct ReadHoldingRegisters {
-        pub starting_address: u16,
-        pub register_count: u16,
+        FUNCTION_CODE_LEN + 1 + body_size as usize
     }
 
-    impl super::Request for ReadHoldingRegisters {
-        fn expected_response_len(&self) -> usize {
-            super::FUNCTION_CODE_LEN + 1 + self.register_count as usize * 2
-        }
+    fn len(&self) -> usize {
+        let body_size: usize = match self {
+            Request::ReadHoldingRegisters { .. } => 4,
+        };
 
-        fn len(&self) -> usize {
-            super::FUNCTION_CODE_LEN
-                + 2 // Starting Address
-                + 2 // Quantity of Registers
-        }
+        FUNCTION_CODE_LEN + body_size
+    }
 
-        fn to_bytes(&self) -> Vec<u8> {
-            let mut pdu = Vec::with_capacity(5);
-            pdu.push(FC_READ_HOLDING_REGISTERS);
-            pdu.extend(&self.starting_address.to_be_bytes());
-            pdu.extend(&self.register_count.to_be_bytes());
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut pdu = Vec::with_capacity(5);
+        pdu.push(FC_READ_HOLDING_REGISTERS);
 
-            pdu
-        }
+        match self {
+            Request::ReadHoldingRegisters {
+                register_count,
+                starting_address,
+            } => {
+                pdu.extend(&starting_address.to_be_bytes());
+                pdu.extend(&register_count.to_be_bytes());
+            }
+        };
+
+        pdu
     }
 }
 
-pub mod response {
-    #[derive(Debug)]
-    pub struct ReadHoldingRegistersResponse {
-        pub byte_count: u8,
-        pub values: Vec<u16>,
-    }
+impl Response {
+    pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
+        let function_code = buf[0];
 
-    impl super::Response for ReadHoldingRegistersResponse {}
+        match function_code {
+            FC_READ_HOLDING_REGISTERS => {
+                let byte_count = buf[1];
+                let mut values: Vec<u16> = Vec::with_capacity((byte_count / 2) as usize);
 
-    impl ReadHoldingRegistersResponse {
-        pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
-            let buf_len = buf.len();
-            let byte_count = buf[2];
-            let mut values: Vec<u16> = Vec::with_capacity((byte_count / 2) as usize);
+                buf[2..]
+                    .iter()
+                    .fold(None, |current_item, value| match current_item {
+                        None => Some(value),
+                        Some(hi) => {
+                            values.push(u16::from_be_bytes([*hi, *value]));
+                            None
+                        }
+                    });
 
-            buf[3..buf_len - 2]
-                .iter()
-                .fold(None, |current_item, value| match current_item {
-                    None => Some(value),
-                    Some(hi) => {
-                        values.push(u16::from_be_bytes([*hi, *value]));
-                        None
-                    }
-                });
-
-            let response = super::response::ReadHoldingRegistersResponse { byte_count, values };
-            Ok(response)
+                Ok(Response::ReadHoldingRegistersResponse { byte_count, values })
+            }
+            _ => Err(format!(
+                "Unsupported function code in response: {}",
+                function_code
+            )),
         }
     }
 }
@@ -84,12 +93,12 @@ pub mod rtu {
 
     pub struct Request {
         pub unit_id: u8,
-        pub request: Box<dyn super::Request>,
+        pub request: super::Request,
     }
 
     pub struct Response {
         pub unit_id: u8,
-        pub response: Box<dyn super::Response>,
+        pub response: super::Response,
     }
 
     impl Request {
@@ -114,7 +123,6 @@ pub mod rtu {
     impl Response {
         pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
             let unit_id = buf[0];
-            let function_code = buf[1];
             let buf_len = buf.len();
             let crc_hi = buf[buf_len - 1];
             let crc_low = buf[buf_len - 2];
@@ -128,18 +136,8 @@ pub mod rtu {
                 ));
             }
 
-            match function_code {
-                super::request::FC_READ_HOLDING_REGISTERS => {
-                    let response = Box::new(
-                        super::response::ReadHoldingRegistersResponse::from_bytes(buf)?,
-                    );
-                    Ok(Self { unit_id, response })
-                }
-
-                _ => {
-                    unimplemented!();
-                }
-            }
+            let response = super::Response::from_bytes(&buf[1..buf_len - 2])?;
+            Ok(Self { unit_id, response })
         }
     }
 
@@ -155,8 +153,6 @@ pub mod rtu {
 }
 
 pub mod tcp {
-    use std::convert::TryInto;
-
     const PROTOCOL_ID: u16 = 0x0000;
 
     pub struct Request {
@@ -164,7 +160,7 @@ pub mod tcp {
         pub protocol_id: u16,
         pub length: u16,
         pub unit_id: u8,
-        pub request: Box<dyn super::Request>,
+        pub request: super::Request,
     }
 
     pub struct Response {
@@ -172,13 +168,13 @@ pub mod tcp {
         pub protocol_id: u16,
         pub length: u16,
         pub unit_id: u8,
-        pub response: Box<dyn super::Response>,
+        pub response: super::Response,
     }
 
     impl Request {
-        pub fn new(unit_id: u8, tid: u16, request: Box<dyn super::Request>) -> Self {
+        pub fn new(unit_id: u8, tid: u16, request: super::Request) -> Self {
             Self {
-                length: request.len() as u16,
+                length: request.len() as u16 + 1,
                 transaction_id: tid,
                 protocol_id: PROTOCOL_ID,
                 request,
@@ -206,30 +202,19 @@ pub mod tcp {
 
     impl Response {
         pub fn from_bytes(buf: &[u8]) -> Result<Self, String> {
-            let transaction_id = u16::from_be_bytes(buf[0..2].try_into().unwrap());
-            let protocol_id = u16::from_be_bytes(buf[2..4].try_into().unwrap());
-            let length = u16::from_be_bytes(buf[4..6].try_into().unwrap());
+            let transaction_id = u16::from_be_bytes([buf[0], buf[1]]);
+            let protocol_id = u16::from_be_bytes([buf[2], buf[3]]);
+            let length = u16::from_be_bytes([buf[4], buf[5]]);
             let unit_id = buf[6];
-            let function_code = buf[7];
+            let response = super::Response::from_bytes(&buf[7..])?;
 
-            match function_code {
-                super::request::FC_READ_HOLDING_REGISTERS => {
-                    let response = Box::new(
-                        super::response::ReadHoldingRegistersResponse::from_bytes(buf)?,
-                    );
-                    Ok(Self {
-                        transaction_id,
-                        protocol_id,
-                        length,
-                        unit_id,
-                        response,
-                    })
-                }
-
-                _ => {
-                    unimplemented!();
-                }
-            }
+            Ok(Self {
+                transaction_id,
+                protocol_id,
+                length,
+                unit_id,
+                response,
+            })
         }
     }
 

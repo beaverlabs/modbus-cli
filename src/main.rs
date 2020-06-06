@@ -190,7 +190,7 @@ fn main() {
     let sampling_interval: u8 =
         clap::value_t!(matches.value_of("sampling_interval"), u8).unwrap_or(1);
 
-    let rdf = matches.value_of("rdf").unwrap();
+    let rdf = matches.value_of("register_definition_file").unwrap();
     let content = std::fs::read_to_string(rdf).unwrap();
     let mappings = serde_json::from_str::<Vec<Mapping>>(&content).unwrap();
 
@@ -318,10 +318,10 @@ fn read_rtu_mapping<T: std::io::Read + std::io::Write>(
     unit_id: u8,
     mapping: &Mapping,
 ) -> (String, u16) {
-    let request = Box::new(modbus::request::ReadHoldingRegisters {
+    let request = modbus::Request::ReadHoldingRegisters {
         starting_address: mapping_address(mapping),
         register_count: mapping_register_count(mapping),
-    });
+    };
 
     let rtu_request = modbus::rtu::Request { request, unit_id };
     let request_bytes = rtu_request.to_bytes();
@@ -349,10 +349,10 @@ fn read_tcp_mapping<T: std::io::Read + std::io::Write>(
     unit_id: u8,
     mapping: &Mapping,
 ) -> MappingValue {
-    let request = Box::new(modbus::request::ReadHoldingRegisters {
+    let request = modbus::Request::ReadHoldingRegisters {
         starting_address: mapping_address(mapping),
         register_count: mapping_register_count(mapping),
-    });
+    };
 
     let tcp_request = modbus::tcp::Request::new(unit_id, 1, request);
     let request_bytes = tcp_request.to_bytes();
@@ -371,6 +371,10 @@ fn read_tcp_mapping<T: std::io::Read + std::io::Write>(
     let resp = modbus::tcp::Response::from_bytes(&resp).unwrap();
 
     println!("Decoded as {:?}", resp);
+
+    match resp.response {
+        modbus::Response::ReadHoldingRegistersResponse { values, .. } => to_value(mapping, &values),
+    }
 }
 
 fn read_rtu_response<T: std::io::Read>(
@@ -400,13 +404,13 @@ fn read_tcp_response<T: std::io::Read>(
 ) -> Result<Vec<u8>, String> {
     let mut buf: Vec<u8> = Vec::with_capacity(request.expected_response_len());
 
-    let mut header = read_response_part(reader, 3).unwrap();
+    let mut header = read_response_part(reader, 6).unwrap();
     println!("Read {} bytes: {:X?}", header.len(), header);
     buf.append(&mut header);
 
-    let remaining_byte_count = buf[2] as usize;
+    let remaining_byte_count: usize = u16::from_be_bytes([buf[4], buf[5]]) as usize;
 
-    let mut rest = read_response_part(reader, remaining_byte_count + 2).unwrap();
+    let mut rest = read_response_part(reader, remaining_byte_count).unwrap();
 
     println!("Read {} bytes: {:X?}", rest.len(), rest);
 
