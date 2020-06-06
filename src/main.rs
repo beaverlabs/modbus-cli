@@ -15,6 +15,7 @@ enum DeviceConnection {
     TCP(Ipv4Addr, u16),
 }
 
+#[derive(Debug)]
 pub enum MappingValue {
     Bitfield(HashMap<String, bool>),
     Boolean(bool),
@@ -208,7 +209,7 @@ fn main() {
 
                 match serialport::open_with_settings(&device_path, &port_settings) {
                     Ok(mut serial_port) => {
-                        let values: Vec<(String, u16)> = mappings
+                        let values: Vec<MappingValue> = mappings
                             .iter()
                             .map(|mapping| read_rtu_mapping(&mut serial_port, unit_id, mapping))
                             .collect();
@@ -317,7 +318,7 @@ fn read_rtu_mapping<T: std::io::Read + std::io::Write>(
     stream: &mut T,
     unit_id: u8,
     mapping: &Mapping,
-) -> (String, u16) {
+) -> MappingValue {
     let request = modbus::Request::ReadHoldingRegisters {
         starting_address: mapping_address(mapping),
         register_count: mapping_register_count(mapping),
@@ -341,7 +342,13 @@ fn read_rtu_mapping<T: std::io::Read + std::io::Write>(
 
     println!("Decoded as {:?}", resp);
 
-    (mapping_key(mapping).to_string(), 0)
+    match resp.response {
+        modbus::Response::ReadHoldingRegisters { values, .. } => to_value(mapping, &values),
+        response => {
+            println!("Unexpected response: {:?}", response);
+            exit(1)
+        }
+    }
 }
 
 fn read_tcp_mapping<T: std::io::Read + std::io::Write>(
@@ -373,7 +380,11 @@ fn read_tcp_mapping<T: std::io::Read + std::io::Write>(
     println!("Decoded as {:?}", resp);
 
     match resp.response {
-        modbus::Response::ReadHoldingRegistersResponse { values, .. } => to_value(mapping, &values),
+        modbus::Response::ReadHoldingRegisters { values, .. } => to_value(mapping, &values),
+        response => {
+            println!("Unexpected response: {:?}", response);
+            exit(1)
+        }
     }
 }
 
@@ -448,16 +459,6 @@ fn mapping_register_count(mapping: &Mapping) -> u16 {
         Mapping::Decimal { count, .. } => *count,
         Mapping::Float { count, .. } => *count,
         Mapping::Integer { count, .. } => *count,
-    }
-}
-
-fn mapping_key(mapping: &Mapping) -> &str {
-    match mapping {
-        Mapping::Bitfield { key, .. } => key,
-        Mapping::Boolean { key, .. } => key,
-        Mapping::Decimal { key, .. } => key,
-        Mapping::Float { key, .. } => key,
-        Mapping::Integer { key, .. } => key,
     }
 }
 
